@@ -2,13 +2,16 @@
  * 承認依頼アドイン
  * メール作成画面で「承認依頼」ボタンを押すと、
  *   1. To の宛先を承認者として読み取り
- *   2. 本文の先頭に「承認する／却下する」ボタンを差し込み
- *   3. 件名の先頭に【承認依頼】を付ける
+ *   2. 本文の先頭に「承認／却下」ボタンと定型文を差し込み
+ *   3. 件名の「Re:【ECN判定】」までを削除して【ECN承認依頼】に置き換える
  * 承認者がボタンを押すと、依頼者（このアドインを使った人）宛ての回答メールが作成される。
  */
 
-const SUBJECT_PREFIX = "【承認依頼】";
-const RECEIPT_LABEL = "受付番号：";
+const SUBJECT_PREFIX = "【ECN承認依頼】";
+const SOURCE_MARKER = "【ECN判定】";
+const ANSWER_PREFIX = "【承認回答】";
+// 本文HTML内のmailtoリンクに含まれる文字列で、承認欄の重複を判定する
+const DUPLICATE_MARKER = encodeURIComponent(ANSWER_PREFIX);
 
 Office.onReady(() => {
   if (Office.actions && Office.actions.associate) {
@@ -24,38 +27,38 @@ if (typeof window !== "undefined") {
 async function insertApproval(event) {
   const item = Office.context.mailbox.item;
   try {
-    const [toList, subject, bodyText] = await Promise.all([
+    const [toList, subject, bodyHtml] = await Promise.all([
       getAsyncValue(item.to),
       getAsyncValue(item.subject),
-      getBodyText(item),
+      getBodyHtml(item),
     ]);
 
     if (!toList || toList.length === 0) {
       await notify(item, "error", "To に承認者を入れてから「承認依頼」を押してください。");
       return;
     }
-    if (bodyText && bodyText.indexOf(RECEIPT_LABEL + "AP-") !== -1) {
+    if (bodyHtml && (bodyHtml.indexOf(DUPLICATE_MARKER) !== -1 || bodyHtml.indexOf(ANSWER_PREFIX) !== -1)) {
       await notify(item, "error", "承認欄はすでに入っています。やり直す場合は、本文の承認欄を削除してから押してください。");
       return;
     }
 
     const me = Office.context.mailbox.userProfile;
     const receiptId = makeReceiptId();
-    const baseSubject = stripPrefix(subject || "");
+    const baseSubject = extractBaseSubject(subject || "");
 
-    const html = buildApprovalBlock({
-      approvers: toList,
-      requesterName: me.displayName,
-      requesterEmail: me.emailAddress,
-      subject: baseSubject,
-      receiptId: receiptId,
-    });
+    const html =
+      buildApprovalBlock({
+        requesterEmail: me.emailAddress,
+        subject: baseSubject,
+        receiptId: receiptId,
+      }) +
+      buildMessageText({
+        approvers: toList,
+        senderDisplayName: me.displayName,
+      });
 
     await prependHtml(item, html);
-
-    if (!(subject || "").startsWith(SUBJECT_PREFIX)) {
-      await setAsyncValue(item.subject, SUBJECT_PREFIX + (subject || ""));
-    }
+    await setAsyncValue(item.subject, SUBJECT_PREFIX + baseSubject);
 
     await notify(item, "info", "承認欄を差し込みました（" + receiptId + "）。内容を確認して送信してください。");
   } catch (e) {
@@ -68,16 +71,12 @@ async function insertApproval(event) {
 /* ---------- 承認欄のHTML ---------- */
 
 function buildApprovalBlock(o) {
-  const approverNames = o.approvers
-    .map((r) => escapeHtml(r.displayName || r.emailAddress) + " さん")
-    .join("、");
-
   const approveLink = buildMailto(o.requesterEmail,
-    "【承認回答】承認｜" + o.subject + "（" + o.receiptId + "）",
+    ANSWER_PREFIX + "承認｜" + o.subject + "（" + o.receiptId + "）",
     "承認します。\r\n\r\nコメント：\r\n");
 
   const rejectLink = buildMailto(o.requesterEmail,
-    "【承認回答】却下｜" + o.subject + "（" + o.receiptId + "）",
+    ANSWER_PREFIX + "却下｜" + o.subject + "（" + o.receiptId + "）",
     "却下します。\r\n\r\n理由：\r\n");
 
   const font = "font-family:'Yu Gothic UI','Meiryo UI',Meiryo,sans-serif;";
@@ -86,32 +85,60 @@ function buildApprovalBlock(o) {
     '<table role="presentation" cellpadding="0" cellspacing="0" border="0" ' +
       'style="width:100%;max-width:560px;border:1px solid #9cc7b3;border-left:6px solid #166e4a;' +
       'background:#f3faf6;margin:0 0 16px 0;' + font + '">' +
-      '<tr><td style="padding:14px 18px;color:#1f2a24;font-size:14px;line-height:1.6;">' +
-        '<div style="font-size:16px;font-weight:bold;margin:0 0 6px 0;">承認のお願い</div>' +
-        '<div>承認者：' + approverNames + '</div>' +
-        '<div style="margin:0 0 12px 0;">ボタンを押すと ' + escapeHtml(o.requesterName) +
-          ' 宛ての回答メールが作成されます。コメントがあれば追記して送信してください。</div>' +
+      '<tr><td style="padding:14px 18px 18px 18px;color:#1f2a24;font-size:14px;line-height:1.6;">' +
+        '<div style="font-size:15px;font-weight:bold;margin:0 0 10px 0;">承認依頼</div>' +
         '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>' +
           '<td style="padding:0 10px 0 0;">' +
             '<a href="' + approveLink + '" style="display:inline-block;padding:9px 22px;background:#166e4a;' +
-            'color:#ffffff;text-decoration:none;font-weight:bold;font-size:14px;border-radius:4px;' + font + '">承認する</a>' +
+            'color:#ffffff;text-decoration:none;font-weight:bold;font-size:14px;border-radius:4px;' + font + '">承認</a>' +
           '</td>' +
           '<td>' +
             '<a href="' + rejectLink + '" style="display:inline-block;padding:8px 22px;background:#ffffff;' +
             'color:#a1262b;text-decoration:none;font-weight:bold;font-size:14px;border:1px solid #a1262b;' +
-            'border-radius:4px;' + font + '">却下する</a>' +
+            'border-radius:4px;' + font + '">却下</a>' +
           '</td>' +
         '</tr></table>' +
-        '<div style="margin:12px 0 0 0;font-size:12px;color:#55625b;">' +
-          'CC の方は回答不要です。　' + RECEIPT_LABEL + escapeHtml(o.receiptId) +
-        '</div>' +
       '</td></tr>' +
     '</table>'
   );
 }
 
+/* ---------- 定型文 ---------- */
+
+function buildMessageText(o) {
+  const addressee = o.approvers
+    .map((r) => familyName(r.displayName || r.emailAddress) + "様")
+    .join("、");
+  const sender = familyName(o.senderDisplayName) || "渡邊";
+
+  const lines = [
+    escapeHtml(addressee),
+    "",
+    escapeHtml(sender) + "です。",
+    "",
+    "標記の件、関連部署でのECN判定が完了しました。",
+    "承認いただける際は、投票ボタンの「承認」をお願いします。",
+    "",
+    "　リンク：",
+    "",
+    "以上です。",
+    "",
+  ];
+  return lines.map((l) => "<div>" + (l === "" ? "<br>" : l) + "</div>").join("");
+}
+
+// 「Jun Kitagawa(北川　淳)」→「北川」、括弧がなければ表示名をそのまま使う
+function familyName(displayName) {
+  const s = String(displayName || "").trim();
+  const m = s.match(/[（(]([^）)]+)[）)]/);
+  if (m) {
+    return m[1].trim().split(/[\s　]+/)[0];
+  }
+  return s;
+}
+
 function buildMailto(to, subject, body) {
-  return "mailto:" + encodeURIComponent(to) +
+  return "mailto:" + to +
     "?subject=" + encodeURIComponent(subject) +
     "&body=" + encodeURIComponent(body);
 }
@@ -125,8 +152,19 @@ function makeReceiptId() {
     "-" + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
 }
 
-function stripPrefix(s) {
-  return s.startsWith(SUBJECT_PREFIX) ? s.slice(SUBJECT_PREFIX.length) : s;
+// 「Re:【ECN判定】xxx」→「xxx」
+// 【ECN判定】が無い場合は、先頭の Re:/Fw: や既存の承認依頼の印だけを取り除く
+function extractBaseSubject(s) {
+  const idx = s.indexOf(SOURCE_MARKER);
+  let rest;
+  if (idx !== -1) {
+    rest = s.slice(idx + SOURCE_MARKER.length);
+  } else {
+    rest = s
+      .replace(/^\s*((re|fw|fwd|返信|転送)\s*[:：]\s*)+/i, "")
+      .replace(/^【ECN承認依頼】|^【承認依頼】/, "");
+  }
+  return rest.trim();
 }
 
 function escapeHtml(s) {
@@ -149,9 +187,9 @@ function setAsyncValue(prop, value) {
   });
 }
 
-function getBodyText(item) {
+function getBodyHtml(item) {
   return new Promise((resolve) => {
-    item.body.getAsync(Office.CoercionType.Text, (r) =>
+    item.body.getAsync(Office.CoercionType.Html, (r) =>
       resolve(r.status === Office.AsyncResultStatus.Succeeded ? r.value : ""));
   });
 }
